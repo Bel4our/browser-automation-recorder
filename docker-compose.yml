@@ -11,6 +11,8 @@ services:
       DB_NAME: videos
       DB_USER: video_user
       DB_PASSWORD: video_pass
+      PYTHON_BIN: python3
+      FFMPEG_BIN: ffmpeg
     depends_on:
       db:
         condition: service_healthy

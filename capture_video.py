@@ -1,12 +1,13 @@
+import argparse
 import csv
 import os
 import sys
 import time
-import argparse
 from pathlib import Path
 import qscript
 
 CSV_PATH = "input.csv"
+
 
 def preview_video(video_url: str, view_seconds: float):
     from playwright.sync_api import sync_playwright
@@ -66,8 +67,16 @@ def main():
                     )
                     print(f"Uploaded: {video_url}")
 
+                    preview_url = video_url
+                    if Path(f"{video_path}.zoom.json").exists():
+                        preview_url = video_client.WaitForProcessedVideo(
+                            server_url=args.server,
+                            company_name=company,
+                        )
+                        print(f"Processed: {preview_url}")
+
                     try:
-                        preview_video(video_url, args.view_seconds)
+                        preview_video(preview_url, args.view_seconds)
                     except Exception as preview_err:
                         print(f"Preview failed for {company}: {preview_err}", file=sys.stderr)
 

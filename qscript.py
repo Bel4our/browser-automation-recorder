@@ -1,7 +1,7 @@
-import os
-import time
+import json
 import math
 import random
+import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -9,7 +9,10 @@ PATH_TO_VIDEO_FOLDER = "./video"
 
 INJECT_EFFECTS_SCRIPT = """
 (() => {
+    window.__pwLastMouse = window.__pwLastMouse || { x: 640, y: 360 };
+
     window.__setCursor = (x, y) => {
+        window.__pwLastMouse = { x, y };
         const c = document.getElementById('__pw_cursor__');
         const h = document.getElementById('__pw_halo__');
         if (c && h) {
@@ -31,7 +34,7 @@ INJECT_EFFECTS_SCRIPT = """
         callout.style.fontSize = '16pt';
         callout.style.display = 'inline-block';
         callout.style.transition = `opacity ${fadeSeconds}s ease-in-out`;
-        
+
         requestAnimationFrame(() => {
             callout.style.opacity = '1';
         });
@@ -42,6 +45,30 @@ INJECT_EFFECTS_SCRIPT = """
                 callout.style.display = 'none';
             }, fadeSeconds * 1000);
         }, fadeSeconds * 1000 + 800);
+    };
+
+    window.__showZoomIndicator = (x, y, state) => {
+        initVisuals();
+        const layer = document.getElementById('__pw_layer__');
+        if (!layer) return;
+        const ring = document.createElement('div');
+        ring.className = 'pw-zoom-ring';
+        ring.style.left = x + 'px';
+        ring.style.top = y + 'px';
+        ring.style.borderColor = state === 'in' ? '#00E676' : '#FF9100';
+        layer.appendChild(ring);
+        setTimeout(() => ring.remove(), 550);
+    };
+
+    window.__zoomAt = async (x, y) => {
+        const px = typeof x === 'number' ? x : window.__pwLastMouse.x;
+        const py = typeof y === 'number' ? y : window.__pwLastMouse.y;
+        let state = 'in';
+        if (typeof window.__pyZoomToggle === 'function') {
+            state = await window.__pyZoomToggle(px, py);
+        }
+        window.__showZoomIndicator(px, py, state);
+        return state;
     };
 
     function initVisuals() {
@@ -59,6 +86,10 @@ INJECT_EFFECTS_SCRIPT = """
                 0% { transform: translate(-50%, -50%) scale(0.1); opacity: 0.9; }
                 100% { transform: translate(-50%, -50%) scale(1.6); opacity: 0; }
             }
+            @keyframes pw-zoom-ring-anim {
+                0% { transform: translate(-50%, -50%) scale(1.25); opacity: 0.95; }
+                100% { transform: translate(-50%, -50%) scale(0.75); opacity: 0; }
+            }
             .pw-ripple-wave {
                 position: absolute;
                 width: 50px;
@@ -68,6 +99,16 @@ INJECT_EFFECTS_SCRIPT = """
                 background: rgba(0, 102, 255, 0.35);
                 pointer-events: none;
                 animation: pw-ripple 0.5s ease-out forwards;
+            }
+            .pw-zoom-ring {
+                position: absolute;
+                width: 72px;
+                height: 72px;
+                border-radius: 50%;
+                border: 3px dashed #00E676;
+                background: transparent;
+                pointer-events: none;
+                animation: pw-zoom-ring-anim 0.5s ease-out forwards;
             }
         `;
         (document.head || target).appendChild(style);
@@ -81,7 +122,7 @@ INJECT_EFFECTS_SCRIPT = """
         cursor.style.cssText = 'position:absolute;width:32px;height:32px;pointer-events:none;display:none;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.5));';
         cursor.innerHTML = `
             <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M2 2L2 26L8.5 20.5L13.5 30.5L17.5 28.5L12.5 18.5L20 18.5L2 2Z" 
+                <path d="M2 2L2 26L8.5 20.5L13.5 30.5L17.5 28.5L12.5 18.5L20 18.5L2 2Z"
                       fill="white" stroke="black" stroke-width="2.2" stroke-linejoin="round"/>
             </svg>
         `;
@@ -114,14 +155,39 @@ INJECT_EFFECTS_SCRIPT = """
         layer.appendChild(ripple);
         setTimeout(() => ripple.remove(), 550);
     }, { capture: true, passive: true });
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'F5') {
+            e.preventDefault();
+            e.stopPropagation();
+            window.__zoomAt(window.__pwLastMouse.x, window.__pwLastMouse.y);
+        }
+    }, { capture: true });
 })();
 """
 
+
+def wait_seconds(page, seconds: float):
+    ms = max(0, int(seconds * 1000))
+    if ms > 0:
+        page.wait_for_timeout(ms)
+
+
 def ShowCallout(page, text: str, bg_color: str = "#FFEB3B", text_color: str = "#000000", fade: float = 2.0):
     try:
-        page.evaluate(f"window.__ShowCallout && window.__ShowCallout('{text}', '{bg_color}', '{text_color}', {fade});")
+        page.evaluate(
+            "([t, bg, tc, f]) => window.__ShowCallout && window.__ShowCallout(t, bg, tc, f)",
+            [text, bg_color, text_color, fade],
+        )
     except Exception:
         pass
+
+
+def trigger_zoom(page, x: float, y: float):
+    try:
+        page.evaluate("([px, py]) => window.__zoomAt && window.__zoomAt(px, py)", [x, y])
+    except Exception as err:
+        print(f"Zoom trigger error: {err}")
 
 
 def smooth_move(page, start_x, start_y, end_x, end_y, steps=35, sleep_time=0.015):
@@ -131,18 +197,18 @@ def smooth_move(page, start_x, start_y, end_x, end_y, steps=35, sleep_time=0.015
         curr_x = start_x + (end_x - start_x) * ease
         curr_y = start_y + (end_y - start_y) * ease
         page.mouse.move(curr_x, curr_y)
-        time.sleep(sleep_time)
+        wait_seconds(page, sleep_time)
 
 
 def human_type(page, text: str):
     for char in text:
         page.keyboard.type(char)
         if char == " ":
-            time.sleep(random.uniform(0.18, 0.32))
+            wait_seconds(page, random.uniform(0.18, 0.32))
         elif random.random() < 0.12:
-            time.sleep(random.uniform(0.20, 0.35))
+            wait_seconds(page, random.uniform(0.20, 0.35))
         else:
-            time.sleep(random.uniform(0.06, 0.13))
+            wait_seconds(page, random.uniform(0.06, 0.13))
 
 
 def CaptureVideo_Magento(
@@ -158,36 +224,58 @@ def CaptureVideo_Magento(
     video_dir = Path(PATH_TO_VIDEO_FOLDER).resolve()
     video_dir.mkdir(parents=True, exist_ok=True)
 
+    viewport = {"width": 1280, "height": 720}
+    fps = 25
+    zoom_factor = 2.0
+    ramp_sec = 0.5
     cur_x, cur_y = 120, 120
+
+    zoom_events = []
+    zoom_state = {"active": False}
+    video_start_time = None
+
+    def on_zoom_toggle(x, y):
+        t = round(max(0.0, time.monotonic() - video_start_time), 3)
+        ev_type = "out" if zoom_state["active"] else "in"
+        zoom_state["active"] = not zoom_state["active"]
+        zoom_events.append({
+            "t": t,
+            "x": round(float(x), 2),
+            "y": round(float(y), 2),
+            "type": ev_type,
+        })
+        return ev_type
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=False,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox"
-            ]
+                "--no-sandbox",
+            ],
         )
-        
+
+        video_start_time = time.monotonic()
         context = browser.new_context(
             record_video_dir=str(video_dir),
-            record_video_size={"width": 1280, "height": 720},
-            viewport={"width": 1280, "height": 720},
+            record_video_size=viewport,
+            viewport=viewport,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale=language
+            locale=language,
         )
 
         context.add_init_script(INJECT_EFFECTS_SCRIPT)
         page = context.new_page()
+        page.expose_function("__pyZoomToggle", on_zoom_toggle)
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.mouse.move(cur_x, cur_y)
-            time.sleep(0.8)
+            wait_seconds(page, 0.8)
 
             query = f"Magento developer in {city}"
             ShowCallout(page, query, bg_color="#FFEB3B", text_color="#000000", fade=1.5)
-            time.sleep(1.2)
+            wait_seconds(page, 1.2)
 
             search_input = page.wait_for_selector('textarea[name="q"]', timeout=15000)
             box = search_input.bounding_box()
@@ -197,12 +285,17 @@ def CaptureVideo_Magento(
             smooth_move(page, cur_x, cur_y, target_x, target_y, steps=35)
             cur_x, cur_y = target_x, target_y
             page.mouse.click(cur_x, cur_y)
-            time.sleep(0.4)
+            wait_seconds(page, 0.4)
+
+            trigger_zoom(page, cur_x, cur_y)
+            wait_seconds(page, 0.6)
 
             human_type(page, query)
-            time.sleep(0.4)
+            wait_seconds(page, 0.4)
 
-            submit_locator = page.locator('form button[type="submit"]:visible, button[type="submit"]:visible, button[aria-label="Search"]:visible').first
+            submit_locator = page.locator(
+                'form button[type="submit"]:visible, button[type="submit"]:visible, button[aria-label="Search"]:visible'
+            ).first
             submit_locator.wait_for(state="visible", timeout=5000)
             s_box = submit_locator.bounding_box()
 
@@ -215,13 +308,15 @@ def CaptureVideo_Magento(
 
             smooth_move(page, cur_x, cur_y, btn_x, btn_y, steps=25)
             cur_x, cur_y = btn_x, btn_y
+            trigger_zoom(page, cur_x, cur_y)
+            wait_seconds(page, 0.5)
             page.mouse.click(cur_x, cur_y)
 
             result_selector = 'a[data-testid="result-title-a"]'
             first_result = page.wait_for_selector(result_selector, timeout=25000)
-            
+
             page.mouse.move(cur_x, cur_y)
-            time.sleep(1.2)
+            wait_seconds(page, 1.2)
 
             r_box = first_result.bounding_box()
             if r_box:
@@ -229,8 +324,15 @@ def CaptureVideo_Magento(
                 res_y = r_box["y"] + r_box["height"] / 2
                 smooth_move(page, cur_x, cur_y, res_x, res_y, steps=40)
                 cur_x, cur_y = res_x, res_y
+
+                trigger_zoom(page, cur_x, cur_y)
+                wait_seconds(page, 0.8)
+
                 page.mouse.click(cur_x, cur_y)
-                time.sleep(3.0)
+                wait_seconds(page, 2.0)
+
+                trigger_zoom(page, cur_x, cur_y)
+                wait_seconds(page, 1.0)
 
         except Exception as e:
             print(f"Error: {company_name}: {e}")
@@ -249,6 +351,20 @@ def CaptureVideo_Magento(
                 final_video_path.unlink()
 
             raw_video_path.rename(final_video_path)
+
+            sidecar_path = Path(f"{final_video_path}.zoom.json")
+            if zoom_events:
+                sidecar_payload = {
+                    "viewport": viewport,
+                    "fps": fps,
+                    "zoom_factor": zoom_factor,
+                    "ramp_sec": ramp_sec,
+                    "events": zoom_events,
+                }
+                sidecar_path.write_text(json.dumps(sidecar_payload, indent=2), encoding="utf-8")
+            elif sidecar_path.exists():
+                sidecar_path.unlink()
+
             return str(final_video_path.resolve())
 
         return None
