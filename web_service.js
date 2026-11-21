@@ -48,6 +48,33 @@ async function initDb(retries = 30, delayMs = 2000) {
             await client.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS zoom_events JSONB;`);
             await client.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';`);
             await client.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS error_message TEXT;`);
+
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS companies (
+                    id SERIAL PRIMARY KEY,
+                    company_name TEXT NOT NULL UNIQUE,
+                    language TEXT,
+                    country TEXT,
+                    postcode TEXT,
+                    city TEXT,
+                    street TEXT,
+                    house_no TEXT,
+                    web TEXT,
+                    status INTEGER,
+                    impressum_url TEXT,
+                    legal_name TEXT,
+                    postal_address TEXT,
+                    handelsregister TEXT,
+                    vat_number TEXT,
+                    phone TEXT,
+                    email TEXT,
+                    responsible_person TEXT,
+                    raw_json JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            `);
+
             client.release();
             return;
         } catch (err) {
@@ -62,7 +89,74 @@ async function initDb(retries = 30, delayMs = 2000) {
 initDb();
 
 const upload = multer({ dest: UPLOADS_DIR });
+const csvUpload = multer({ storage: multer.memoryStorage() });
 app.use(express.json());
+
+function parseCsvSemicolon(text) {
+    const clean = text.replace(/^\uFEFF/, '');
+    const rows = [];
+    let currentRow = [];
+    let currentField = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < clean.length; i++) {
+        const ch = clean[i];
+        const next = clean[i + 1];
+
+        if (inQuotes) {
+            if (ch === '"' && next === '"') {
+                currentField += '"';
+                i++;
+            } else if (ch === '"') {
+                inQuotes = false;
+            } else {
+                currentField += ch;
+            }
+        } else {
+            if (ch === '"') {
+                inQuotes = true;
+            } else if (ch === ';') {
+                currentRow.push(currentField);
+                currentField = '';
+            } else if (ch === '\r' && next === '\n') {
+                currentRow.push(currentField);
+                rows.push(currentRow);
+                currentRow = [];
+                currentField = '';
+                i++;
+            } else if (ch === '\n' || ch === '\r') {
+                currentRow.push(currentField);
+                rows.push(currentRow);
+                currentRow = [];
+                currentField = '';
+            } else {
+                currentField += ch;
+            }
+        }
+    }
+
+    if (currentField.length > 0 || currentRow.length > 0) {
+        currentRow.push(currentField);
+        rows.push(currentRow);
+    }
+
+    const nonEmptyRows = rows.filter((r) => r.some((cell) => cell.trim() !== ''));
+    if (nonEmptyRows.length === 0) {
+        return [];
+    }
+
+    const headers = nonEmptyRows[0].map((h) => h.trim());
+    const result = [];
+    for (let r = 1; r < nonEmptyRows.length; r++) {
+        const values = nonEmptyRows[r];
+        const obj = {};
+        for (let c = 0; c < headers.length; c++) {
+            obj[headers[c]] = (values[c] !== undefined ? values[c] : '').trim();
+        }
+        result.push(obj);
+    }
+    return result;
+}
 
 function sanitizeCompany(raw) {
     const cleaned = (raw || 'video').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -148,6 +242,144 @@ async function processVideoJob(videoId, baseUrl) {
         throw err;
     }
 }
+
+
+app.get('/upload_companies', (req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Upload Companies CSV</title>
+</head>
+<body>
+  <h1>Upload Companies CSV</h1>
+  <form action="/upload_companies" method="post" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv,text/csv" required>
+    <button type="submit">Upload</button>
+  </form>
+  <p><a href="/companies">View all companies (JSON)</a></p>
+</body>
+</html>`);
+});
+
+app.post('/upload_companies', csvUpload.any(), async (req, res) => {
+    const uploadedFile = req.files && req.files.length > 0 ? req.files[0] : null;
+    if (!uploadedFile) {
+        return res.status(400).json({ error: 'CSV file is required (multipart/form-data)' });
+    }
+
+    let rows;
+    try {
+        const csvText = uploadedFile.buffer.toString('utf-8');
+        rows = parseCsvSemicolon(csvText);
+    } catch (err) {
+        return res.status(400).json({ error: `Invalid CSV: ${err.message}` });
+    }
+
+    const upsertSql = `
+        INSERT INTO companies (
+            company_name, language, country, postcode, city, street, house_no, web, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+        ON CONFLICT (company_name) DO UPDATE SET
+            language   = EXCLUDED.language,
+            country    = EXCLUDED.country,
+            postcode   = EXCLUDED.postcode,
+            city       = EXCLUDED.city,
+            street     = EXCLUDED.street,
+            house_no   = EXCLUDED.house_no,
+            web        = EXCLUDED.web,
+            updated_at = NOW()
+        RETURNING (xmax = 0) AS inserted;
+    `;
+
+    let imported = 0;
+    let updated = 0;
+    let totalRows = 0;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const row of rows) {
+            const companyName = row['Company Name'] || row['company_name'] || '';
+            if (!companyName) {
+                continue;
+            }
+            totalRows++;
+
+            const emptyToNull = (val) => (val !== undefined && val !== '' ? val : null);
+            const result = await client.query(upsertSql, [
+                companyName,
+                emptyToNull(row['Language'] ?? row['language']),
+                emptyToNull(row['Country'] ?? row['country']),
+                emptyToNull(row['Postcode'] ?? row['postcode']),
+                emptyToNull(row['City'] ?? row['city']),
+                emptyToNull(row['Street'] ?? row['street']),
+                emptyToNull(row['HouseNo'] ?? row['house_no']),
+                emptyToNull(row['Web'] ?? row['web']),
+            ]);
+
+            if (result.rows[0].inserted) {
+                imported++;
+            } else {
+                updated++;
+            }
+        }
+        await client.query('COMMIT');
+        return res.status(200).json({
+            imported,
+            updated,
+            total_rows: totalRows,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('CSV import DB error:', err.message);
+        return res.status(500).json({ error: 'Database import error' });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/companies', async (req, res) => {
+    try {
+        const statusParam = req.query.status;
+        if (statusParam !== undefined && statusParam !== '') {
+            const statusCode = parseInt(statusParam, 10);
+            if (Number.isNaN(statusCode)) {
+                return res.status(400).json({ error: 'Invalid status query parameter' });
+            }
+            const result = await pool.query(
+                'SELECT * FROM companies WHERE status = $1 ORDER BY id ASC;',
+                [statusCode]
+            );
+            return res.status(200).json(result.rows);
+        }
+
+        const result = await pool.query('SELECT * FROM companies ORDER BY id ASC;');
+        return res.status(200).json(result.rows);
+    } catch (err) {
+        console.error('GET /companies error:', err.message);
+        return res.status(500).json({ error: 'Database error' });
+    }
+});
+
+app.get('/companies/:company_name', async (req, res) => {
+    const companyName = req.params.company_name;
+    try {
+        const result = await pool.query(
+            'SELECT * FROM companies WHERE company_name = $1;',
+            [companyName]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: `Company '${companyName}' not found` });
+        }
+        return res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error('GET /companies/:company_name error:', err.message);
+        return res.status(500).json({ error: 'Database error' });
+    }
+});
+
 
 app.post(
     '/upload',
